@@ -1,0 +1,102 @@
+name: Alpine build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ALPINE_VERSION: '3.22'
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-alpine${{ env.ALPINE_VERSION }}-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-alpine${{ env.ALPINE_VERSION }}-${{ matrix.arch }}-
+
+      # The build runs through `docker run` instead of a job container, because
+      # JavaScript actions are not supported in Alpine containers on arm64 runners.
+      - name: Build in Alpine ${{ env.ALPINE_VERSION }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            "alpine:$ALPINE_VERSION" sh -euxc '
+              apk add --no-cache alpine-sdk linux-headers cmake gperf ccache file \
+                openssl-dev openssl-libs-static zlib-dev zlib-static
+              export CCACHE_DIR=/src/.ccache CCACHE_MAXSIZE=2G
+              ccache -z
+              cmake -S . -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/src/dist \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_EXE_LINKER_FLAGS=-static \
+                -DOPENSSL_USE_STATIC_LIBS=TRUE \
+                -DZLIB_USE_STATIC_LIBS=ON
+              cmake --build build --target install -j "$(nproc)"
+              ccache -s
+              strip dist/bin/telegram-bot-api
+              file dist/bin/telegram-bot-api
+              dist/bin/telegram-bot-api --version
+              chown -R "$HOST_UID:$HOST_GID" build dist .ccache
+            '
+
+      - name: Package
+        run: |
+          name="telegram-bot-api-linux-musl-${{ matrix.arch }}"
+          tar -C dist/bin -czf "$name.tar.gz" telegram-bot-api
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-bot-api-linux-musl-${{ matrix.arch }}
+          path: telegram-bot-api-linux-musl-${{ matrix.arch }}.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
